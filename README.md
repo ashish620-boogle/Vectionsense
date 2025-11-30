@@ -1,4 +1,4 @@
-# Cybersickness Prediction with IMU and HRV
+# Vectionsense
 
 This project implements a Transformer-based model to predict cybersickness levels using Inertial Measurement Unit (IMU) data and Heart Rate Variability (HRV) features.
 
