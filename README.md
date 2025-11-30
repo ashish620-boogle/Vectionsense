@@ -47,10 +47,6 @@ Contains detailed visualizations of the model's performance:
 *   **Participant Metrics**: `loocv_participantwise_metrics.png` (Accuracy, Precision, Recall, F1-score per participant).
 *   **Correlation Plots**: `corr_pearson_sickness_level.png` (Correlation between features and sickness levels).
 
-### `results/`
-Contains summary results and additional comparison plots:
-*   **Longevity Analysis**: `longevity_results.csv` and plots showing model performance over time (if applicable).
-*   **Model Comparison**: `transformer_models_comparison.png` (Comparison of different model configurations).
 
 ## Project Structure
 
