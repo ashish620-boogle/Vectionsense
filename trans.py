@@ -42,6 +42,7 @@ BATCH_SIZE = 64
 EPOCHS = 20
 LR = 1e-3
 PLOTS_DIR = "plots_transformer"
+LONG_DIR = "longevity_data"
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 plt.style.use("default")
@@ -57,6 +58,14 @@ plt.rcParams.update({
     "legend.facecolor": "white",
 })
 
+PLOTS_DIR = "plots_transformer"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# Directory to store all model .pth files
+MODELS_DIR = "models_transformer"
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+PROPOSED_MODEL_PATH = os.path.join(MODELS_DIR, "PROPOSED_MODEL.pth")
 
 # =============================================================================
 # FILE PATHS
@@ -120,6 +129,27 @@ def drop_non_feature_columns(df, label_col="Cybersickness"):
     if cols_to_drop:
         df = df.drop(columns=list(set(cols_to_drop)))
     return df
+
+
+def save_model_checkpoint(model, scaler, feature_names, train_pids, test_pids, tag, history=None):
+    """
+    Save model + scaler + metadata into a .pth checkpoint under MODELS_DIR.
+    Returns the full path to the saved file.
+    """
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "scaler": scaler,
+        "feature_names": feature_names,
+        "train_pids": train_pids,
+        "test_pids": test_pids,
+        "tag": tag,
+        "history": history,
+    }
+
+    file_name = f"{tag}.pth"
+    save_path = os.path.join(MODELS_DIR, file_name)
+    torch.save(checkpoint, save_path)
+    return save_path
 
 
 def align_hr_to_imu_length(hr_path, imu_path):
@@ -336,7 +366,7 @@ def plot_loocv_participantwise(loocv_df, out_path_png, out_path_pdf=None):
         "xtick.labelsize": 12,
         "ytick.labelsize": 14,
         "legend.fontsize": 10,
-        "figure.dpi": 180,
+        "figure.dpi": 300,
         "axes.facecolor": "white",
         "figure.facecolor": "white",
     })
@@ -766,9 +796,12 @@ def run_longevity_experiment(
         * scale with the already-trained 'scaler'
         * evaluate with the already-trained 'model'
     - Saves:
-        * longevity_results.csv (participant, day, acc/prec/rec/f1)
-        * longevity_curve_metrics_over_days.png (mean curves across participants)
+        * longevity_results.csv (participant, day, detections, avg_hr)
+        * longevity_curve.png   (per-day detections + avg HR per participant)
     """
+
+    # Make sure longevity_dir exists (for saving aligned HR files)
+    os.makedirs(longevity_dir, exist_ok=True)
 
     # -------------------------------------------------
     # 1) Discover day-wise IMU and HR files
@@ -837,8 +870,11 @@ def run_longevity_experiment(
                 print(f"[LONGEVITY] Failed HR alignment for {pid}, day {day}. Skipping.")
                 continue
 
-            # Save temporary aligned HR file (in-memory df → csv)
-            temp_hr_path = os.path.join(PLOTS_DIR, f"temp_{pid}_day{day}_hr_aligned.csv")
+            # Save aligned HR file into longevity_dir (NOT PLOTS_DIR)
+            temp_hr_path = os.path.join(
+                longevity_dir,
+                f"{pid}{day}_hr_aligned_cubic.csv"
+            )
             aligned_hr_df.to_csv(temp_hr_path, index=False)
 
             # Build COMBINED (IMU+HR) sequences for this (pid, day)
@@ -860,7 +896,7 @@ def run_longevity_experiment(
                 print(f"[LONGEVITY] Missing feature names for {pid}, day {day}. Skipping.")
                 continue
 
-            exp_names = expected_feature_names              # list of training feature names
+            exp_names = expected_feature_names  # list of training feature names
             name_to_idx = {n: i for i, n in enumerate(feat_names)}
             D_exp = len(exp_names)
 
@@ -895,123 +931,149 @@ def run_longevity_experiment(
             # --- Model predictions for this (pid, day) ---
             y_true_day, y_pred_day = get_predictions_and_labels(model, loader)
 
-            # Classification metrics (still stored in longevity_results.csv)
-            acc  = accuracy_score(y_true_day, y_pred_day)
-            prec = precision_score(y_true_day, y_pred_day, zero_division=0)
-            rec  = recall_score(y_true_day, y_pred_day, zero_division=0)
-            f1   = f1_score(y_true_day, y_pred_day, zero_division=0)
-
-            # --- NEW: count of cybersickness detections (predicted 1) for this day ---
+            # Count of cybersickness detections (predicted 1) for this day
             detections = int((y_pred_day == 1).sum())
 
-            # --- NEW: average HRV proxy from aligned HR (SDNN over RR intervals) ---
+            # Average heart rate (BPM) from aligned HR
             bpm_arr = aligned_hr_df["bpm"].astype(float).values
             hr_safe = np.where(bpm_arr > 0, bpm_arr, np.nan)
-            rr = 60.0 / hr_safe                  # RR intervals in seconds
-            hrv_sdnn = float(np.nanstd(rr))      # HRV proxy (SDNN)
+            avg_hr = float(np.nanmean(hr_safe))
 
             rows.append({
                 "participant": pid,
                 "day": day,
-                "accuracy":  acc,
-                "precision": prec,
-                "recall":    rec,
-                "f1":        f1,
-                "detections": detections,   # NEW
-                "hrv_sdnn":   hrv_sdnn,     # NEW
-                "avg_hrv":   hrv_sdnn,     # NEW
+                "detections": detections,
+                "avg_hr": avg_hr,
             })
 
             print(
                 f"[LONGEVITY] {pid} – Day {day}: "
-                f"acc={acc:.3f}, prec={prec:.3f}, rec={rec:.3f}, f1={f1:.3f}, "
-                f"detections={detections}, hrv_sdnn={hrv_sdnn:.4f}"
+                f"detections={detections}, avg_hr={avg_hr:.2f} bpm"
             )
-
 
     if not rows:
         print("[LONGEVITY] No valid (participant, day) sequences. Skipping plots.")
         return
 
+    # ------------------------------------------------------------------
+    # Save per-day results and build longevity curve FROM THIS DATAFRAME
+    # ------------------------------------------------------------------
     longevity_df = pd.DataFrame(rows)
     longevity_csv_path = os.path.join(PLOTS_DIR, "longevity_results.csv")
     longevity_df.to_csv(longevity_csv_path, index=False)
     print(f"[LONGEVITY] Saved per-day results to {longevity_csv_path}")
 
-    # -------------------------------------------------
-    # Cybersickness count + average HRV per participant
-    # -------------------------------------------------
-    if {"detections", "avg_hrv"}.issubset(longevity_df.columns):
+    # Sort for neat plotting
+    longevity_df = longevity_df.sort_values(["day", "participant"])
 
-        # Aggregate over days: total cybersickness, mean HRV per participant
-        agg_df = longevity_df.groupby("participant").agg(
-            total_detections=("detections", "sum"),
-            mean_hrv=("avg_hrv", "mean")
-        ).reset_index()
+    days = sorted(longevity_df["day"].unique())
+    participants = list(longevity_df["participant"].unique())
 
-        participants = agg_df["participant"].tolist()
-        x = np.arange(len(participants))
+    # Pivot: rows = day, columns = participant
+    det_pivot = longevity_df.pivot(index="day", columns="participant", values="detections")
+    hr_pivot  = longevity_df.pivot(index="day", columns="participant", values="avg_hr")
 
-        counts = agg_df["total_detections"].values
-        mean_hrv = agg_df["mean_hrv"].values
+    det_pivot = det_pivot.reindex(days)
+    hr_pivot  = hr_pivot.reindex(days)
 
-        plt.rcParams.update({
-            "font.size": 12,
-            "axes.labelsize": 14,
-            "xtick.labelsize": 11,
-            "ytick.labelsize": 11,
-            "legend.fontsize": 10,
-        })
+    x = np.arange(len(days))
+    n_participants = len(participants)
+    bar_width = 0.8 / max(1, n_participants)
 
-        fig, ax1 = plt.subplots(figsize=(7, 4))
+    # Nice colors
+    bar_colors  = ["#F1948A", "#BB8FCE", "#85C1E9", "#82E0AA", "#F7DC6F", "#F8C471"]
+    line_colors = ["#1F77B4", "#FF7F0E", "#2CA02C", "#D62728", "#9467BD", "#8C564B"]
+    marker_styles = ["s", "^", "o", "D", "v", "P"]
 
-        # --- Bars: # cybersickness detections ---
-        bar_width = 0.6
-        bars = ax1.bar(
-            x,
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=400)
+
+    # -------- Bars: # cybersickness detections per day per participant --------
+    for i, pid in enumerate(participants):
+        offset = (i - (n_participants - 1) / 2) * bar_width
+        counts = det_pivot[pid].values
+
+        ax.bar(
+            x + offset,
             counts,
-            width=bar_width,
-            color="#4e79a7",
+            bar_width,
+            label=f"Participant {i+1}",
+            color=bar_colors[i % len(bar_colors)],
             edgecolor="black",
-            label="# cybersickness detections",
+            linewidth=2
         )
-        ax1.set_xlabel("Participant")
-        ax1.set_ylabel("# cybersickness detections")
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(participants, rotation=0)
 
-        # --- Second axis: line for avg HR/HRV ---
-        ax2 = ax1.twinx()
+    if not det_pivot.empty:
+        max_det = np.nanmax(det_pivot.values)
+        ax.set_ylim(0, max_det * 1.2 if max_det > 0 else 1.0)
+    else:
+        ax.set_ylim(0, 1.0)
+
+    ax.set_ylabel(
+        "Number of times Cybersickness detected",
+        fontweight='bold',
+        fontsize=14
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"Day {d}" for d in days], fontweight='bold', fontsize=18, rotation=45)
+
+    ax.tick_params(axis='both', labelsize=12)
+    for label in ax.get_xticklabels():
+        label.set_fontweight('bold')
+    for label in ax.get_yticklabels():
+        label.set_fontweight('bold')
+
+    # -------- Secondary axis: average heart rate per day per participant ------
+    ax2 = ax.twinx()
+
+    for i, pid in enumerate(participants):
+        avg_hr_vals = hr_pivot[pid].values
+
         ax2.plot(
             x,
-            mean_hrv,
-            marker="o",
-            linewidth=2.0,
-            color="#e15759",
-            label="Avg HRV / BPM",
+            avg_hr_vals,
+            label=f"Average Heart rate P{i+1}",
+            color=line_colors[i % len(line_colors)],
+            marker=marker_styles[i % len(marker_styles)],
+            markersize=8,
+            linewidth=3
         )
-        ax2.set_ylabel("Average HRV / heart rate")
 
-        # --- Combine legends from both axes ---
-        lines, labels = [], []
-        for ax in (ax1, ax2):
-            h, l = ax.get_legend_handles_labels()
-            lines.extend(h)
-            labels.extend(l)
+    if not hr_pivot.empty:
+        ymin = np.nanmin(hr_pivot.values)
+        ymax = np.nanmax(hr_pivot.values)
+        if np.isfinite(ymin) and np.isfinite(ymax):
+            ax2.set_ylim(ymin - 5, ymax + 5)
 
-        leg = ax1.legend(lines, labels, loc="upper right", frameon=True, facecolor="white")
-        for txt in leg.get_texts():
-            txt.set_fontweight("bold")
+    ax2.set_ylabel(
+        "Average Heart rate (bpm)",
+        fontweight='bold',
+        fontsize=14
+    )
+    ax2.tick_params(axis='y', labelsize=12)
+    for label in ax2.get_yticklabels():
+        label.set_fontweight('bold')
 
-        fig.tight_layout()
-        out_path = os.path.join(PLOTS_DIR, "participant_cybersickness_vs_hrv.png")
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close()
+    # ------- Combined legend (bars + lines) -------
+    handles1, labels1 = ax.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(
+        handles1 + handles2,
+        labels1 + labels2,
+        loc="upper left",
+        frameon=True,
+        framealpha=1,
+        edgecolor="black",
+        fontsize=10,
+        prop={'weight': 'bold'}
+    )
 
-        print(f"[LONGEVITY] Saved participant cybersickness/HRV plot to {out_path}")
-    else:
-        print("[LONGEVITY] 'detections' or 'avg_hrv' missing in longevity_df; "
-              "skipping participant summary plot.")
+    plt.tight_layout()
+    out_path = os.path.join(PLOTS_DIR, "longevity_curve.png")
+    plt.savefig(out_path, dpi=400, bbox_inches="tight")
+    plt.close()
+
+    print(f"[LONGEVITY] Saved longevity curve plot to {out_path}")
+
 
 
 
@@ -1200,6 +1262,22 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
     print(f"Loss: {test_loss:.4f}")
     print(f"Accuracy: {test_acc:.3f}, Precision: {test_prec:.3f}, "
           f"Recall: {test_rec:.3f}, F1: {test_f1:.3f}\n")
+    
+    # ------------------------------------------------
+    # Save this trained model as a .pth checkpoint
+    # ------------------------------------------------
+    model_path = save_model_checkpoint(
+        model=model,
+        scaler=scaler,
+        feature_names=feature_names,
+        train_pids=train_pids,
+        test_pids=test_pids,
+        tag=f"transformer_{tag}",
+        history=history,
+    )
+
+    print(f"[{tag}] Saved model checkpoint to {model_path}")
+
 
     epochs = history["epoch"]
 
@@ -1281,6 +1359,7 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
         "y_pred": y_pred,
         "model": model,
         "scaler": scaler,
+        "model_path": model_path,
     }
 
 
@@ -1639,6 +1718,22 @@ def main():
     res_hr    = train_transformer_for_dataset(data_hr,    feat_hr,    train_pids, test_pids, tag="hr_only")
     res_both  = train_transformer_for_dataset(data_both,  feat_both,  train_pids, test_pids, tag="combined")
 
+    # ------------------------------------------------
+    # Save the final combined model as PROPOSED_MODEL.pth
+    # ------------------------------------------------
+    proposed_checkpoint = {
+        "model_state_dict": res_both["model"].state_dict(),
+        "scaler": res_both["scaler"],
+        "feature_names": feat_both,
+        "train_pids": train_pids,
+        "test_pids": test_pids,
+        "tag": "PROPOSED_MODEL",
+        "history": None,  # or res_both.get("history") if you want to store it
+    }
+    torch.save(proposed_checkpoint, PROPOSED_MODEL_PATH)
+    print(f"[COMBINED] Saved proposed model to {PROPOSED_MODEL_PATH}")
+
+
     # 2b) SSQ correlation analysis (ALL participants, Sickness level only)
     analyze_ssq_correlations(
         data_both=data_both,
@@ -1661,7 +1756,7 @@ def main():
         expected_feature_names=feat_both,
         window_sec=WINDOW_SEC,
         sampling_hz=SAMPLING_HZ,
-        longevity_dir="."   # folder where k1/a1/k2 files live
+        longevity_dir=LONG_DIR   # folder where k1/a1/k2 files live
     )
 
 

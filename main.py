@@ -1312,9 +1312,9 @@ def predict_from_raw(imu_df, hr_df, imu_model, imu_scaler, hr_model, hr_scaler):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
-    # create_all_interpolated_hr_csvs()
+    create_all_interpolated_hr_csvs()
     # 1) Cross-validation first
-    run_cross_validation_with_fusion(k_folds=5, interp_method="cubic")
+    # run_cross_validation_with_fusion(k_folds=5, interp_method="cubic")
 
-    # 2) Then full train/test + 4-way comparison & plots
-    models = run_full_pipeline()
+    # # 2) Then full train/test + 4-way comparison & plots
+    # models = run_full_pipeline()
