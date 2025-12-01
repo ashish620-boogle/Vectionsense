@@ -602,10 +602,7 @@ def get_classifiers():
     return {
         "Nearest Neighbors": KNeighborsClassifier(),
         "Gaussian Process": GaussianProcessClassifier(random_state=seed),
-        "Decision Tree": DecisionTreeClassifier(random_state=seed),
         "Random Forest": RandomForestClassifier(n_estimators=200, random_state=seed),
-        "Neural Net": MLPClassifier(max_iter=500, random_state=seed),
-        "AdaBoost": AdaBoostClassifier(random_state=seed),
         "Naive Bayes": GaussianNB(),
         "QDA": QuadraticDiscriminantAnalysis(),
         "XGBoost": XGBClassifier(
