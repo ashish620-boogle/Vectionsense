@@ -24,6 +24,7 @@ from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
 from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import GroupKFold, KFold
 from xgboost import XGBClassifier
+from joblib import dump, load  # <--- add this
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -38,6 +39,8 @@ np.random.seed(GLOBAL_SEED)
 torch.manual_seed(GLOBAL_SEED)
 
 seed = 42
+MODELS_ML_DIR = "models_ml"
+os.makedirs(MODELS_ML_DIR, exist_ok=True)
 
 
 # =============================================================================
@@ -428,6 +431,60 @@ def segment_to_sequences(df, label_col="Cybersickness", window_sec=10, sampling_
 
     return X_seq, np.array(y_seq, dtype=np.int64)
 
+def save_all_combined_classifiers(classifiers, scaler, feature_names, train_pids, test_pids, results):
+    """
+    Save *all* classical ML classifiers that were trained on the Combined (IMU+HR) features.
+
+    classifiers: dict name -> fitted model (from train_and_evaluate)
+    scaler:     StandardScaler fitted on combined features
+    feature_names: list of combined feature names
+    train_pids, test_pids: participants used in this split
+    results:    metrics dict per classifier (same keys as from train_and_evaluate)
+    """
+    for name, clf in classifiers.items():
+        metrics = results.get(name, {})
+        payload = {
+            "mode": "combined",
+            "clf_name": name,
+            "model": clf,
+            "scaler": scaler,
+            "feature_names": feature_names,
+            "train_pids": train_pids,
+            "test_pids": test_pids,
+            "metrics": metrics,
+        }
+        safe_name = name.replace(" ", "_")
+        file_name = f"combined_{safe_name}.pkl"
+        path = os.path.join(MODELS_ML_DIR, file_name)
+        dump(payload, path)
+        print(f"[SAVE] Saved combined classifier '{name}' to {path}")
+
+
+def save_best_ml_model(mode, clf_name, model, scaler, metrics):
+    """
+    Save the best classical ML model for a given mode (imu/hr/combined)
+    so that the transformer script can load and compare later.
+
+    mode: 'imu', 'hr', or 'combined'
+    clf_name: classifier name string (e.g. 'Random Forest')
+    model: trained sklearn classifier
+    scaler: fitted StandardScaler
+    metrics: dict with keys ['accuracy', 'precision', 'recall', 'f1']
+    """
+    payload = {
+        "mode": mode,
+        "clf_name": clf_name,
+        "model": model,
+        "scaler": scaler,
+        "metrics": metrics,
+    }
+    safe_name = clf_name.replace(" ", "_")
+    file_name = f"best_{mode}_{safe_name}.pkl"
+    path = os.path.join(MODELS_ML_DIR, file_name)
+    dump(payload, path)
+    print(f"[SAVE] Saved best {mode} model ({clf_name}) to {path}")
+    return path
+
 
 # =============================================================================
 # IMU FEATURE EXTRACTION
@@ -544,8 +601,6 @@ def collate_fn(batch):
 def get_classifiers():
     return {
         "Nearest Neighbors": KNeighborsClassifier(),
-        "Linear SVM": SVC(kernel="linear", probability=True, random_state=seed),
-        "RBF SVM": SVC(kernel="rbf", probability=True, random_state=seed),
         "Gaussian Process": GaussianProcessClassifier(random_state=seed),
         "Decision Tree": DecisionTreeClassifier(random_state=seed),
         "Random Forest": RandomForestClassifier(n_estimators=200, random_state=seed),
@@ -701,7 +756,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, prefix):
                             dpi=300, bbox_inches="tight")
                 plt.close()
 
-    return best_clf, scaler, results
+    return best_clf, scaler, results, classifiers
 
 
 def run_cross_validation(k_folds=5):
@@ -964,23 +1019,34 @@ def run_full_pipeline():
     y_test_combined  = np.concatenate([combined_data[pid][1] for pid in test_pids], axis=0)
 
     # 5) Train + evaluate IMU classifiers
-    imu_best_model, imu_scaler, imu_results = train_and_evaluate(
+    imu_best_model, imu_scaler, imu_results, imu_classifiers = train_and_evaluate(
         X_train_imu, y_train_imu, X_test_imu, y_test_imu,
         imu_feature_names, prefix="imu"
     )
 
     # 6) Train + evaluate HR classifiers
-    hr_best_model, hr_scaler, hr_results = train_and_evaluate(
+    hr_best_model, hr_scaler, hr_results, hr_classifiers = train_and_evaluate(
         X_train_hr, y_train_hr, X_test_hr, y_test_hr,
         hr_feature_names, prefix="hr"
     )
 
     # 6b) Train + evaluate COMBINED (IMU + HR) classifiers
-    combined_best_model, combined_scaler, combined_results = train_and_evaluate(
+    combined_best_model, combined_scaler, combined_results, combined_classifiers = train_and_evaluate(
         X_train_combined, y_train_combined,
         X_test_combined, y_test_combined,
         combined_feature_names, prefix="combined"
     )
+
+    # Save ALL combined (IMU+HR) classifiers for later comparison with Transformer
+    save_all_combined_classifiers(
+        classifiers=combined_classifiers,
+        scaler=combined_scaler,
+        feature_names=combined_feature_names,
+        train_pids=train_pids,
+        test_pids=test_pids,
+        results=combined_results,
+    )
+
 
     # 7) FUSION EVALUATION (IMU + HR + bpm rule)
 
@@ -1049,6 +1115,33 @@ def run_full_pipeline():
     best_imu_name = max(imu_results, key=lambda n: imu_results[n]["accuracy"])
     best_hr_name = max(hr_results, key=lambda n: hr_results[n]["accuracy"])
     best_combined_name = max(combined_results, key=lambda n: combined_results[n]["accuracy"])
+
+    # ------------------------------------------------
+    # SAVE BEST CLASSICAL MODELS FOR LATER COMPARISON
+    # ------------------------------------------------
+    save_best_ml_model(
+        mode="imu",
+        clf_name=best_imu_name,
+        model=imu_best_model,
+        scaler=imu_scaler,
+        metrics=imu_results[best_imu_name],
+    )
+
+    save_best_ml_model(
+        mode="hr",
+        clf_name=best_hr_name,
+        model=hr_best_model,
+        scaler=hr_scaler,
+        metrics=hr_results[best_hr_name],
+    )
+
+    save_best_ml_model(
+        mode="combined",
+        clf_name=best_combined_name,
+        model=combined_best_model,
+        scaler=combined_scaler,
+        metrics=combined_results[best_combined_name],
+    )
 
     comp = {
         "IMU-only": {
@@ -1312,9 +1405,9 @@ def predict_from_raw(imu_df, hr_df, imu_model, imu_scaler, hr_model, hr_scaler):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
-    create_all_interpolated_hr_csvs()
+    # create_all_interpolated_hr_csvs()
     # 1) Cross-validation first
-    # run_cross_validation_with_fusion(k_folds=5, interp_method="cubic")
+    run_cross_validation_with_fusion(k_folds=5, interp_method="cubic")
 
     # # 2) Then full train/test + 4-way comparison & plots
-    # models = run_full_pipeline()
+    models = run_full_pipeline()

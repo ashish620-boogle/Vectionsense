@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 import pandas as pd
+from joblib import load
 
 import torch
 import torch.nn as nn
@@ -64,6 +65,7 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 
 # Directory to store all model .pth files
 MODELS_DIR = "models_transformer"
+CLASSICAL_MODELS_DIR = "models_ml"   # same folder used in main.py
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 PROPOSED_MODEL_PATH = os.path.join(MODELS_DIR, "PROPOSED_MODEL.pth")
@@ -130,6 +132,57 @@ def drop_non_feature_columns(df, label_col="Cybersickness"):
     if cols_to_drop:
         df = df.drop(columns=list(set(cols_to_drop)))
     return df
+
+
+def load_all_combined_ml_metrics(models_dir=CLASSICAL_MODELS_DIR):
+    """
+    Load *all* combined (IMU+HR) classical ML classifiers saved by main.py.
+
+    Returns a dict:
+      {
+        "ML-<clf_name>": {
+            "clf_name": <clf_name>,
+            "accuracy": ...,
+            "precision": ...,
+            "recall": ...,
+            "f1": ...
+        },
+        ...
+      }
+    """
+    metrics_map = {}
+
+    if not os.path.exists(models_dir):
+        print(f"[CLASSICAL] Directory '{models_dir}' not found. Skipping ML vs Transformer comparison.")
+        return metrics_map
+
+    for fname in os.listdir(models_dir):
+        if not (fname.startswith("combined_") and fname.endswith(".pkl")):
+            continue
+
+        path = os.path.join(models_dir, fname)
+        try:
+            payload = load(path)
+        except Exception as e:
+            print(f"[CLASSICAL] Could not load {path}: {e}")
+            continue
+
+        clf_name = payload.get("clf_name", os.path.splitext(fname)[0])
+        m = payload.get("metrics", {})
+        if not m:
+            continue
+
+        label = f"{clf_name}"
+        metrics_map[label] = {
+            "clf_name": clf_name,
+            "accuracy":  float(m.get("accuracy", 0.0)),
+            "precision": float(m.get("precision", 0.0)),
+            "recall":    float(m.get("recall", 0.0)),
+            "f1":        float(m.get("f1", 0.0)),
+        }
+
+    print("[CLASSICAL] Loaded combined ML classifiers:", list(metrics_map.keys()))
+    return metrics_map
 
 
 def save_model_checkpoint(model, scaler, feature_names, train_pids, test_pids, tag, history=None):
@@ -421,6 +474,80 @@ def plot_loocv_participantwise(loocv_df, out_path_png, out_path_pdf=None):
     ax.set_axisbelow(True)
 
     ax.legend(loc="upper left", ncols=len(METRIC_NAMES), frameon=True, facecolor="white")
+
+    fig.tight_layout()
+    fig.savefig(out_path_png, bbox_inches="tight", dpi=300)
+    if out_path_pdf is not None:
+        fig.savefig(out_path_pdf, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+def plot_model_comparison_grouped(metrics_df, out_path_png, out_path_pdf=None):
+    """
+    Grouped bar plot: model-wise metrics (Accuracy, Precision, Recall, F1),
+    styled similarly to the LOOCV participant-wise plot.
+
+    metrics_df: index = model names (rows),
+                columns = ["accuracy","precision","recall","f1"]
+    """
+    plt.rcParams.update({
+        "font.size": 14,
+        "axes.titlesize": 18,
+        "axes.labelsize": 16,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 14,
+        "legend.fontsize": 10,
+        "figure.dpi": 300,
+        "axes.facecolor": "white",
+        "figure.facecolor": "white",
+    })
+
+    METRIC_NAMES = ["accuracy", "precision", "recall", "f1"]
+    METRIC_LABELS = ["Accuracy", "Precision", "Recall", "F1-score"]
+
+    COLORS  = ["#4e79a7", "#e15759", "#7c48ff", "#59a14f"]
+    HATCHES = ["////", "\\\\\\\\", "....", "xx"]
+
+    models = list(metrics_df.index)
+    n_models = len(models)
+    x = np.arange(n_models)
+
+    width = 0.18   # thinner bars
+
+    fig, ax = plt.subplots(figsize=(max(8, n_models * 0.8), 3))
+
+    for i, (metric, mlab) in enumerate(zip(METRIC_NAMES, METRIC_LABELS)):
+        if metric not in metrics_df.columns:
+            continue
+        values = metrics_df[metric].values
+        offset = (i - (len(METRIC_NAMES) - 1) / 2) * width
+
+        ax.bar(
+            x + offset,
+            values,
+            width,
+            label=mlab,
+            color=COLORS[i],
+            edgecolor="black",
+            linewidth=1.0,
+            hatch=HATCHES[i],
+        )
+
+    ax.set_ylabel("Score")
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=25, ha="right")
+
+    ax.set_ylim(0, 1.05)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.35)
+    ax.set_axisbelow(True)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.18),
+        ncols=2,
+        frameon=True,
+        facecolor="white",
+        borderaxespad=0.4,
+    )
 
     fig.tight_layout()
     fig.savefig(out_path_png, bbox_inches="tight", dpi=300)
@@ -1779,6 +1906,41 @@ def main():
     res_imu   = train_transformer_for_dataset(data_imu,   feat_imu,   train_pids, test_pids, tag="imu_only")
     res_hr    = train_transformer_for_dataset(data_hr,    feat_hr,    train_pids, test_pids, tag="hr_only")
     res_both  = train_transformer_for_dataset(data_both,  feat_both,  train_pids, test_pids, tag="combined")
+
+    # ------------------------------------------------
+    # COMPARE: all classical ML (Combined) vs Combined Transformer
+    # ------------------------------------------------
+    ml_combined = load_all_combined_ml_metrics()
+
+    compare_rows = []
+
+    # 1) Add all ML classifiers (Combined features)
+    for label, m in ml_combined.items():
+        compare_rows.append({
+            "model": label,   # e.g., "ML-Random Forest"
+            "accuracy":  m["accuracy"],
+            "precision": m["precision"],
+            "recall":    m["recall"],
+            "f1":        m["f1"],
+        })
+
+    # 2) Add Combined Transformer (proposed model)
+    compare_rows.append({
+        "model": "Transformer",
+        "accuracy":  res_both["metrics"]["accuracy"],
+        "precision": res_both["metrics"]["precision"],
+        "recall":    res_both["metrics"]["recall"],
+        "f1":        res_both["metrics"]["f1"],
+    })
+
+    if len(compare_rows) >= 2:
+        compare_df = pd.DataFrame(compare_rows).set_index("model")
+        cmp_png = os.path.join(PLOTS_DIR, "combined_ml_vs_transformer_grouped_metrics.png")
+        cmp_pdf = os.path.join(PLOTS_DIR, "combined_ml_vs_transformer_grouped_metrics.pdf")
+        plot_model_comparison_grouped(compare_df, cmp_png, cmp_pdf)
+        print("[COMPARE] Saved Combined ML vs Transformer grouped metrics plot to:", cmp_png)
+    else:
+        print("[COMPARE] Not enough models to compare ML vs Transformer.")
 
     # ------------------------------------------------
     # Save the final combined model as PROPOSED_MODEL.pth
