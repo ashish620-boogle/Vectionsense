@@ -17,6 +17,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
 from matplotlib.lines import Line2D
 from scipy.interpolate import CubicSpline
 import warnings
+import time
 warnings.filterwarnings("ignore")
 
 # =============================================================================
@@ -1149,7 +1150,17 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
       {
         "metrics": {acc, precision, recall, f1},
         "y_true": np.array,
-        "y_pred": np.array
+        "y_pred": np.array,
+        "model": model,
+        "scaler": scaler,
+        "model_path": str,
+        "complexity": {
+            "total_params": int,
+            "model_size_mb": float,
+            "train_time_sec": float,
+            "test_time_sec": float,
+            "single_sample_pred_time_sec": float or None,
+        },
       }
     Also saves confusion matrix and feature-importance plot.
     """
@@ -1210,6 +1221,11 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
+    # --------- COMPLEXITY: total params + model size ---------
+    total_params = sum(p.numel() for p in model.parameters())
+    bytes_per_param = 4  # float32
+    model_size_mb = total_params * bytes_per_param / (1024 ** 2)
+
     best_f1 = -1.0
     best_state = None
 
@@ -1226,6 +1242,10 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
         "val_f1": [],
     }
 
+    # --------- COMPLEXITY: measure TRAIN time ---------
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    train_start = time.time()
 
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_acc, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion)
@@ -1236,7 +1256,7 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
               f"val_loss={val_loss:.4f}, val_acc={val_acc:.3f}, val_prec={val_prec:.3f}, "
               f"val_rec={val_rec:.3f}, val_f1={val_f1:.3f}")
 
-        # --- NEW: log into history ---
+        # --- log into history ---
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
@@ -1251,18 +1271,30 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
             best_f1 = val_f1
             best_state = model.state_dict()
 
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    train_end = time.time()
+    train_time_sec = train_end - train_start
 
     # Load best
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # Final test metrics
+    # --------- COMPLEXITY: measure TEST time (final evaluation only) ---------
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    test_start = time.time()
     test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(model, test_loader, criterion)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    test_end = time.time()
+    test_time_sec = test_end - test_start
+
     print(f"\n=== [{tag}] FINAL TEST PERFORMANCE ===")
     print(f"Loss: {test_loss:.4f}")
     print(f"Accuracy: {test_acc:.3f}, Precision: {test_prec:.3f}, "
           f"Recall: {test_rec:.3f}, F1: {test_f1:.3f}\n")
-    
+
     # ------------------------------------------------
     # Save this trained model as a .pth checkpoint
     # ------------------------------------------------
@@ -1278,22 +1310,33 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
 
     print(f"[{tag}] Saved model checkpoint to {model_path}")
 
+    # --------- COMPLEXITY: time for predicting one sample ---------
+    single_sample_pred_time_sec = None
+    if len(test_ds) > 0:
+        sample_x = test_ds.seq_list[0]  # [T, D]
+        sample_tensor = torch.tensor(sample_x[None, ...], dtype=torch.float32, device=device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        with torch.no_grad():
+            _ = model(sample_tensor)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.time()
+        single_sample_pred_time_sec = t1 - t0
 
+    # --- Learning curves (unchanged) ---
     epochs = history["epoch"]
 
-    # --- Loss vs Epoch ---
+    # Loss vs Epoch
     plt.figure(figsize=(4, 3))
     plt.plot(epochs, history["train_loss"], label="Train loss", linestyle="-")
     plt.plot(epochs, history["val_loss"],   label="Val loss",   linestyle="-")
-
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    # plt.title(f"Loss vs Epoch ({tag})", fontsize=9)
-
     leg = plt.legend(fontsize=7, loc="upper right")
     for txt in leg.get_texts():
         txt.set_fontweight("bold")
-
     plt.tight_layout()
     plt.savefig(
         os.path.join(PLOTS_DIR, f"learning_curve_loss_{tag}.png"),
@@ -1302,19 +1345,15 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
     )
     plt.close()
 
-    # --- Accuracy vs Epoch ---
+    # Accuracy vs Epoch
     plt.figure(figsize=(4, 3))
     plt.plot(epochs, history["train_acc"], label="Train acc", linestyle="-")
     plt.plot(epochs, history["val_acc"],   label="Val acc",   linestyle="-")
-
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
-    # plt.title(f"Accuracy vs Epoch ({tag})", fontsize=9)
-
     leg = plt.legend(fontsize=7, loc="lower right")
     for txt in leg.get_texts():
         txt.set_fontweight("bold")
-
     plt.tight_layout()
     plt.savefig(
         os.path.join(PLOTS_DIR, f"learning_curve_acc_{tag}.png"),
@@ -1323,23 +1362,17 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
     )
     plt.close()
 
-
     # Confusion matrix – BFRB-style
     y_true, y_pred = get_predictions_and_labels(model, test_loader)
     cm = confusion_matrix(y_true, y_pred)
-
     unique_labels = np.unique(y_true)
-    class_labels = [str(l) for l in unique_labels]   # or ["No CS", "CS"] if you prefer
-
+    class_labels = [str(l) for l in unique_labels]
     out_path = os.path.join(PLOTS_DIR, f"transformer_confusion_matrix_{tag}.png")
     plot_confusion_matrix_compact(
         cm,
         class_labels=class_labels,
         out_path=out_path,
-        # title=f"Confusion Matrix ({tag})",
     )
-
-
 
     # Feature importance (only for learned models, not fused)
     if feature_names is not None:
@@ -1353,6 +1386,31 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
         "f1":        test_f1,
     }
 
+    # --------- WRITE COMPLEXITY FILE FOR COMBINED MODEL ONLY ---------
+    complexity_info = {
+        "tag": tag,
+        "total_params": total_params,
+        "model_size_mb": model_size_mb,
+        "train_time_sec": train_time_sec,
+        "test_time_sec": test_time_sec,
+        "single_sample_pred_time_sec": single_sample_pred_time_sec,
+        "single_sample_pred_time_ms": (
+            single_sample_pred_time_sec * 1000.0 if single_sample_pred_time_sec is not None else None
+        ),
+    }
+
+    if tag == "combined":
+        comp_path = os.path.join(MODELS_DIR, "combined_model_complexity.csv")
+        df_comp = pd.DataFrame([complexity_info])
+        write_header = not os.path.exists(comp_path)
+        df_comp.to_csv(
+            comp_path,
+            mode="a" if not write_header else "w",
+            header=write_header,
+            index=False,
+        )
+        print(f"[{tag}] Saved complexity metrics to {comp_path}")
+
     return {
         "metrics": metrics,
         "y_true": y_true,
@@ -1360,7 +1418,9 @@ def train_transformer_for_dataset(data_by_pid, feature_names, train_pids, test_p
         "model": model,
         "scaler": scaler,
         "model_path": model_path,
+        "complexity": complexity_info,
     }
+
 
 
 # =============================================================================
@@ -1643,17 +1703,18 @@ def main():
 
         # IMU boxplot: sway_var vs Cybersickness (instead of movement_energy)
         if "sway_var" in df_imu.columns:
-            plt.figure(figsize=(3, 3))
+            plt.figure(figsize=(2.2, 2.0))
             sns.boxplot(
                 data=df_imu,
                 x="Cybersickness",
                 y="sway_var",
+                width=0.3,
             )
-            plt.xlabel("Cybersickness (0 = No, 1 = Yes)", fontsize=8)
-            plt.ylabel("Sway variance", fontsize=8)
+            plt.xlabel("Cybersickness (0 = No, 1 = Yes)", fontsize=6)
+            plt.ylabel("Sway variance", fontsize=6)
             # plt.title("IMU: Sway variance vs Cybersickness", fontsize=9)
-            plt.xticks(fontsize=8)
-            plt.yticks(fontsize=8)
+            plt.xticks(fontsize=6)
+            plt.yticks(fontsize=6)
             plt.tight_layout()
             plt.savefig(
                 os.path.join(PLOTS_DIR, "boxplot_imu_sway_var_vs_cybersickness.png"),
@@ -1678,17 +1739,18 @@ def main():
         df_hr["Cybersickness"] = all_hr_y
 
         if "hr" in df_hr.columns:
-            plt.figure(figsize=(3, 3))
+            plt.figure(figsize=(2.2, 2.0))
             sns.boxplot(
                 data=df_hr,
                 x="Cybersickness",
                 y="hr",
+                width=0.3,
             )
-            plt.xlabel("Cybersickness (0 = No, 1 = Yes)", fontsize=8)
-            plt.ylabel("Heart rate (bpm)", fontsize=8)
+            plt.xlabel("Cybersickness (0 = No, 1 = Yes)", fontsize=6)
+            plt.ylabel("Heart rate (bpm)", fontsize=6)
             # plt.title("HR: BPM vs Cybersickness", fontsize=9)
-            plt.xticks(fontsize=8)
-            plt.yticks(fontsize=8)
+            plt.xticks(fontsize=6)
+            plt.yticks(fontsize=6)
             plt.tight_layout()
             plt.savefig(
                 os.path.join(PLOTS_DIR, "boxplot_hr_bpm_vs_cybersickness.png"),
