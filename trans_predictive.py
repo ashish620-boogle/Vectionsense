@@ -1,6 +1,7 @@
 import os
 import random
 import copy
+import glob
 import numpy as np
 import pandas as pd
 
@@ -13,6 +14,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+try:
+    from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+except Exception:
+    ImageSequenceClip = None
+
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -51,8 +58,11 @@ LR_SCHED_PATIENCE = 3
 LR_SCHED_MIN_LR = 1e-6
 AUX_TARGET = "latent"  # "raw_seq", "latent", "raw_mean", "both", "none"
 AUX_METRICS_EVERY = 1
-LATENT_PLOT_EVERY = 10
+LATENT_PLOT_EVERY = 1
 LATENT_PLOT_MAX_POINTS = 300
+MAKE_LATENT_VIDEO = True
+LATENT_VIDEO_FPS = 6
+LATENT_VIDEO_DELETE_PNG = True
 
 MODELS_DIR = "models_transformer"
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -724,7 +734,7 @@ def plot_aux_history(history, out_path):
     ax[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.savefig(out_path, dpi=300)
     plt.close()
 
 
@@ -872,6 +882,60 @@ def plot_confusion_matrix(cm, class_labels, out_path, title=None):
     plt.tight_layout()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
+
+
+def make_epoch_video_and_cleanup(png_dir, pattern, out_path, fps=6, delete_png=True):
+    frames = sorted(glob.glob(os.path.join(png_dir, pattern)))
+    if not frames:
+        print("[WARN] No epoch PNGs found for video generation.")
+        return
+
+    if ImageSequenceClip is None:
+        print("[WARN] moviepy not available. Skipping video generation.")
+        return
+
+    try:
+        # Load and pad frames to a common size (MoviePy requires identical sizes)
+        imgs = []
+        max_h, max_w = 0, 0
+        for f in frames:
+            img = mpimg.imread(f)
+            if img.ndim == 2:
+                img = np.stack([img, img, img], axis=-1)
+            if img.dtype != np.uint8:
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+            max_h = max(max_h, img.shape[0])
+            max_w = max(max_w, img.shape[1])
+            imgs.append(img)
+
+        padded = []
+        for img in imgs:
+            h, w = img.shape[:2]
+            pad_h = max_h - h
+            pad_w = max_w - w
+            if pad_h > 0 or pad_w > 0:
+                img = np.pad(
+                    img,
+                    ((0, pad_h), (0, pad_w), (0, 0)),
+                    mode="constant",
+                    constant_values=0,
+                )
+            padded.append(img)
+
+        clip = ImageSequenceClip(padded, fps=fps)
+        clip.write_videofile(out_path, codec="libx264", audio=False)
+        clip.close()
+        print(f"[VIDEO] Saved epoch video to {out_path}")
+    except Exception as e:
+        print(f"[WARN] Video generation failed: {e}")
+        return
+
+    if delete_png:
+        for f in frames:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 # =============================================================================
 # MAIN
@@ -1115,6 +1179,15 @@ def main():
         class_labels=[0, 1],
         out_path=os.path.join(EVAL_PLOTS_DIR, "confusion_matrix.png"),
     )
+
+    if MAKE_LATENT_VIDEO:
+        make_epoch_video_and_cleanup(
+            png_dir=PLOTS_DIR,
+            pattern="latent_alignment_epoch_*.png",
+            out_path=os.path.join(EVAL_PLOTS_DIR, "latent_alignment_epochs.mp4"),
+            fps=LATENT_VIDEO_FPS,
+            delete_png=LATENT_VIDEO_DELETE_PNG,
+        )
 
     # Save checkpoint
     checkpoint = {
