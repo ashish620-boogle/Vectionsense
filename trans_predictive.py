@@ -6,10 +6,13 @@ import pandas as pd
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -31,7 +34,7 @@ HR_INTERP_METHOD = "cubic"   # "cubic", "linear", "nearest"
 # Predictive window settings
 # Input: [t - LOOKBACK_SEC, t]
 # Output: cybersickness at t + HORIZON_SEC (optional FUTURE_WINDOW_SEC aggregation)
-LOOKBACK_SEC = 10
+LOOKBACK_SEC = 4
 HORIZON_SEC = 0
 FUTURE_WINDOW_SEC = 1
 SAMPLING_HZ = 1
@@ -40,17 +43,41 @@ STRIDE_SEC = 1  # sliding window stride; set to LOOKBACK_SEC for non-overlap
 BATCH_SIZE = 128
 EPOCHS = 100
 LR = 1e-4
-LATENT_LOSS_WEIGHT = 0.03
+LATENT_LOSS_WEIGHT = 1.0
 EARLY_STOP_PATIENCE = 7
 EARLY_STOP_MIN_DELTA = 1e-4
 LR_SCHED_FACTOR = 0.5
 LR_SCHED_PATIENCE = 3
 LR_SCHED_MIN_LR = 1e-6
+AUX_TARGET = "latent"  # "raw_seq", "latent", "raw_mean", "both", "none"
+AUX_METRICS_EVERY = 1
+LATENT_PLOT_EVERY = 10
+LATENT_PLOT_MAX_POINTS = 300
 
 MODELS_DIR = "models_transformer"
 os.makedirs(MODELS_DIR, exist_ok=True)
+PLOTS_DIR = "plots_predictive"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+EVAL_PLOTS_DIR = "plots_predictive_eval"
+os.makedirs(EVAL_PLOTS_DIR, exist_ok=True)
 PREDICTIVE_MODEL_PATH = os.path.join(MODELS_DIR, "PREDICTIVE_MODEL.pth")
+PROPOSED_MODEL_PATH = os.path.join(MODELS_DIR, "PROPOSED_MODEL.pth")
+USE_PROPOSED_MODEL = True
+USE_PROPOSED_SCALER = True
+ACC_EVERY = 1
 
+plt.style.use("default")
+plt.rcParams.update({
+    "font.size": 10,
+    "axes.linewidth": 1.3,
+    "axes.labelweight": "bold",
+    "axes.titleweight": "bold",
+    "font.weight": "bold",
+    "axes.grid": False,
+    "legend.frameon": True,
+    "legend.edgecolor": "black",
+    "legend.facecolor": "white",
+})
 # =============================================================================
 # FILE PATHS
 # =============================================================================
@@ -191,6 +218,33 @@ def apply_scaler(seq_list, scaler):
         flat_scaled = scaler.transform(flat)
         scaled.append(flat_scaled.reshape(T, D))
     return scaled
+
+
+def load_proposed_model(feature_dim, checkpoint_path):
+    if not os.path.exists(checkpoint_path):
+        print(f"[WARN] PROPOSED_MODEL not found at {checkpoint_path}.")
+        return None, None, None
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model = TimeSeriesTransformer(
+        feature_dim=feature_dim,
+        d_model=64,
+        nhead=4,
+        num_layers=2,
+        num_classes=2,
+        dim_feedforward=128,
+        dropout=0.1,
+    ).to(device)
+
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    scaler = ckpt.get("scaler", None)
+    feature_names = ckpt.get("feature_names", None)
+    return model, scaler, feature_names
 
 # =============================================================================
 # BUILD PREDICTIVE SEQUENCES
@@ -433,13 +487,56 @@ class TransformerEncoderBackbone(nn.Module):
         return x
 
 
-class PredictiveTransformer(nn.Module):
+class TimeSeriesTransformer(nn.Module):
     """
-    Past window -> predict future latent -> classify future state.
+    Same architecture as PROPOSED_MODEL in trans.py.
+    Provides encode() and classify_latent() helpers.
     """
     def __init__(self, feature_dim, d_model=64, nhead=4, num_layers=2,
                  num_classes=2, dim_feedforward=128, dropout=0.1):
         super().__init__()
+        self.input_proj = nn.Linear(feature_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.pos_enc = PositionalEncoding(d_model)
+        self.cls_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, num_classes),
+        )
+
+    def encode(self, x):
+        x = self.input_proj(x)
+        x = self.pos_enc(x)
+        x = self.encoder(x)
+        x = x.mean(dim=1)
+        return x
+
+    def classify_latent(self, latent):
+        return self.cls_head(latent)
+
+    def forward(self, x):
+        latent = self.encode(x)
+        logits = self.cls_head(latent)
+        return logits
+
+
+class PredictiveTransformer(nn.Module):
+    """
+    Past window -> predict future sensor sequence.
+    """
+    def __init__(self, feature_dim, future_steps, d_model=64, nhead=4, num_layers=2,
+                 num_classes=2, dim_feedforward=128, dropout=0.1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.future_steps = future_steps
         self.encoder = TransformerEncoderBackbone(
             feature_dim=feature_dim,
             d_model=d_model,
@@ -454,6 +551,12 @@ class PredictiveTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
+        self.future_seq_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, future_steps * feature_dim),
+        )
         self.cls_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -461,87 +564,101 @@ class PredictiveTransformer(nn.Module):
             nn.Linear(d_model, num_classes),
         )
 
-    def forward(self, x_past, x_future=None, return_latent=False):
+    def forward(self, x_past, x_future=None, return_targets=False, teacher_encoder=None):
         past_repr = self.encoder(x_past)
         pred_future_repr = self.future_predictor(past_repr)
-        logits = self.cls_head(pred_future_repr)
+        pred_future_seq = self.future_seq_head(pred_future_repr)
+        pred_future_seq = pred_future_seq.view(
+            x_past.size(0), self.future_steps, self.feature_dim
+        )
 
-        if x_future is None or not return_latent:
-            return logits, pred_future_repr, None
+        if x_future is None or not return_targets:
+            return pred_future_repr, pred_future_seq, None, None
 
         with torch.no_grad():
-            true_future_repr = self.encoder(x_future)
+            if teacher_encoder is not None:
+                true_future_repr = teacher_encoder(x_future)
+            else:
+                true_future_repr = self.encoder(x_future)
+            true_future_seq = x_future
 
-        return logits, pred_future_repr, true_future_repr
+        return pred_future_repr, pred_future_seq, true_future_repr, true_future_seq
 
 # =============================================================================
 # TRAIN / EVAL
 # =============================================================================
 
-def train_one_epoch(model, loader, optimizer, ce_loss, mse_loss, latent_weight):
+def train_one_epoch(model, loader, optimizer, mse_loss, latent_weight, aux_target, teacher_encoder=None):
     model.train()
     total_loss = 0.0
-    all_y = []
-    all_pred = []
 
-    for X_past, X_future, y in loader:
+    for X_past, X_future, _ in loader:
         X_past = X_past.to(device)
         X_future = X_future.to(device)
-        y = y.to(device)
 
         optimizer.zero_grad()
-        logits, pred_repr, true_repr = model(X_past, X_future, return_latent=True)
+        pred_lat, pred_seq, true_lat, true_seq = model(
+            X_past, X_future, return_targets=True, teacher_encoder=teacher_encoder
+        )
+        loss_aux = 0.0
+        if aux_target == "raw_seq":
+            loss_aux = mse_loss(pred_seq, true_seq)
+        elif aux_target == "raw_mean":
+            loss_aux = mse_loss(pred_seq.mean(dim=1), true_seq.mean(dim=1))
+        elif aux_target == "latent":
+            loss_aux = mse_loss(pred_lat, true_lat)
+        elif aux_target == "both":
+            loss_aux = mse_loss(pred_seq, true_seq) + mse_loss(pred_lat, true_lat)
+        elif aux_target == "none":
+            loss_aux = 0.0
+        else:
+            raise ValueError(f"Unknown AUX_TARGET: {aux_target}")
 
-        loss_cls = ce_loss(logits, y)
-        loss_lat = mse_loss(pred_repr, true_repr)
-        loss = loss_cls + latent_weight * loss_lat
+        loss = latent_weight * loss_aux
 
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item() * X_past.size(0)
-        preds = logits.argmax(dim=1)
-        all_y.append(y.cpu().numpy())
-        all_pred.append(preds.cpu().numpy())
 
-    all_y = np.concatenate(all_y)
-    all_pred = np.concatenate(all_pred)
     avg_loss = total_loss / len(loader.dataset)
-    acc = accuracy_score(all_y, all_pred)
-    f1 = f1_score(all_y, all_pred, zero_division=0)
-    return avg_loss, acc, f1
+    return avg_loss
 
 
-def evaluate(model, loader, ce_loss):
+def evaluate_pred_loss(model, loader, mse_loss, latent_weight, aux_target, teacher_encoder=None):
     model.eval()
     total_loss = 0.0
-    all_y = []
-    all_pred = []
 
     with torch.no_grad():
-        for X_past, _, y in loader:
+        for X_past, X_future, _ in loader:
             X_past = X_past.to(device)
-            y = y.to(device)
+            X_future = X_future.to(device)
 
-            logits, _, _ = model(X_past, return_latent=False)
-            loss = ce_loss(logits, y)
+            pred_lat, pred_seq, true_lat, true_seq = model(
+                X_past, X_future, return_targets=True, teacher_encoder=teacher_encoder
+            )
+
+            if aux_target == "raw_seq":
+                loss_aux = mse_loss(pred_seq, true_seq)
+            elif aux_target == "raw_mean":
+                loss_aux = mse_loss(pred_seq.mean(dim=1), true_seq.mean(dim=1))
+            elif aux_target == "latent":
+                loss_aux = mse_loss(pred_lat, true_lat)
+            elif aux_target == "both":
+                loss_aux = mse_loss(pred_seq, true_seq) + mse_loss(pred_lat, true_lat)
+            elif aux_target == "none":
+                loss_aux = 0.0
+            else:
+                raise ValueError(f"Unknown AUX_TARGET: {aux_target}")
+
+            loss = latent_weight * loss_aux
             total_loss += loss.item() * X_past.size(0)
 
-            preds = logits.argmax(dim=1)
-            all_y.append(y.cpu().numpy())
-            all_pred.append(preds.cpu().numpy())
-
-    all_y = np.concatenate(all_y)
-    all_pred = np.concatenate(all_pred)
     avg_loss = total_loss / len(loader.dataset)
-    acc = accuracy_score(all_y, all_pred)
-    prec = precision_score(all_y, all_pred, zero_division=0)
-    rec = recall_score(all_y, all_pred, zero_division=0)
-    f1 = f1_score(all_y, all_pred, zero_division=0)
-    return avg_loss, acc, prec, rec, f1
+    return avg_loss
 
 
-def get_predictions(model, loader):
+def get_predictions_with_proposed(model, proposed_model, loader):
     model.eval()
     all_y = []
     all_pred = []
@@ -549,11 +666,212 @@ def get_predictions(model, loader):
         for X_past, _, y in loader:
             X_past = X_past.to(device)
             y = y.to(device)
-            logits, _, _ = model(X_past, return_latent=False)
+            pred_lat, _, _, _ = model(X_past, return_targets=False)
+            if proposed_model is not None:
+                logits = proposed_model.classify_latent(pred_lat)
+            else:
+                logits = model.cls_head(pred_lat)
             preds = logits.argmax(dim=1)
             all_y.append(y.cpu().numpy())
             all_pred.append(preds.cpu().numpy())
     return np.concatenate(all_y), np.concatenate(all_pred)
+
+
+def compute_aux_metrics(model, loader, teacher_encoder=None):
+    model.eval()
+    lat_mse_sum = 0.0
+    seq_mse_sum = 0.0
+    lat_cos_sum = 0.0
+    total = 0
+
+    with torch.no_grad():
+        for X_past, X_future, _ in loader:
+            X_past = X_past.to(device)
+            X_future = X_future.to(device)
+
+            pred_lat, pred_seq, true_lat, true_seq = model(
+                X_past, X_future, return_targets=True, teacher_encoder=teacher_encoder
+            )
+            bs = X_past.size(0)
+
+            lat_mse_sum += F.mse_loss(pred_lat, true_lat, reduction="mean").item() * bs
+            seq_mse_sum += F.mse_loss(pred_seq, true_seq, reduction="mean").item() * bs
+            lat_cos_sum += F.cosine_similarity(pred_lat, true_lat, dim=1).mean().item() * bs
+            total += bs
+
+    if total == 0:
+        return None, None, None
+
+    return lat_mse_sum / total, seq_mse_sum / total, lat_cos_sum / total
+
+
+def plot_aux_history(history, out_path):
+    if not history["epoch"]:
+        return
+
+    fig, ax = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+
+    ax[0].plot(history["epoch"], history["latent_mse"], label="latent_mse")
+    ax[0].plot(history["epoch"], history["seq_mse"], label="seq_mse")
+    ax[0].set_ylabel("MSE")
+    ax[0].legend()
+    ax[0].grid(True, alpha=0.3)
+
+    ax[1].plot(history["epoch"], history["latent_cos"], label="latent_cos")
+    ax[1].set_ylabel("Cosine sim")
+    ax[1].set_xlabel("Epoch")
+    ax[1].legend()
+    ax[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_latent_alignment(model, loader, out_path, max_points=300, teacher_encoder=None):
+    model.eval()
+    pred_list = []
+    true_list = []
+
+    with torch.no_grad():
+        for X_past, X_future, _ in loader:
+            X_past = X_past.to(device)
+            X_future = X_future.to(device)
+            pred_lat, _, true_lat, _ = model(
+                X_past, X_future, return_targets=True, teacher_encoder=teacher_encoder
+            )
+            pred_list.append(pred_lat.cpu().numpy())
+            true_list.append(true_lat.cpu().numpy())
+            if sum(p.shape[0] for p in pred_list) >= max_points:
+                break
+
+    if not pred_list:
+        return
+
+    pred = np.vstack(pred_list)
+    true = np.vstack(true_list)
+    if pred.shape[0] < 2:
+        return
+    if pred.shape[0] > max_points:
+        idx = np.random.choice(pred.shape[0], size=max_points, replace=False)
+        pred = pred[idx]
+        true = true[idx]
+
+    Z = PCA(n_components=2).fit_transform(np.vstack([pred, true]))
+    pred_z = Z[:pred.shape[0]]
+    true_z = Z[pred.shape[0]:]
+
+    plt.figure(figsize=(5, 5))
+    plt.scatter(true_z[:, 0], true_z[:, 1], s=18, alpha=0.7, label="true_future")
+    plt.scatter(pred_z[:, 0], pred_z[:, 1], s=18, alpha=0.7, label="pred_future")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_loss_curves(history, out_path):
+    if not history["epoch"]:
+        return
+
+    plt.figure(figsize=(4, 3))
+    plt.plot(history["epoch"], history["train_loss"], label="Train loss", linestyle="-")
+    plt.plot(history["epoch"], history["test_loss"],  label="Test loss",  linestyle="-")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    leg = plt.legend(fontsize=7, loc="upper right")
+    for txt in leg.get_texts():
+        txt.set_fontweight("bold")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_accuracy_curves(history, out_path):
+    if not history["epoch"]:
+        return
+
+    plt.figure(figsize=(4, 3))
+    plt.plot(history["epoch"], history["train_acc"], label="Train acc", linestyle="-")
+    plt.plot(history["epoch"], history["test_acc"],  label="Test acc",  linestyle="-")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    leg = plt.legend(fontsize=7, loc="lower right")
+    for txt in leg.get_texts():
+        txt.set_fontweight("bold")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_metrics_bar(metrics_dict, out_path):
+    labels = list(metrics_dict.keys())
+    values = [metrics_dict[k] for k in labels]
+
+    plt.figure(figsize=(4.5, 3.2))
+    colors = ["#4e79a7", "#e15759", "#7c48ff", "#59a14f"]  # Accuracy, Precision, Recall, F1
+    hatches = ["////", "\\\\\\\\", "....", "xx"]
+    bars = plt.bar(labels, values, color=colors, edgecolor="black", linewidth=1.0)
+    for bar, hatch in zip(bars, hatches):
+        bar.set_hatch(hatch)
+    plt.ylim(0, 1.0)
+    plt.ylabel("Score")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_confusion_matrix(cm, class_labels, out_path, title=None):
+    """
+    Compact confusion matrix:
+      - Blues colormap
+      - Bold labels
+      - White grid between cells
+      - Larger annotation fonts
+      - No title by default
+    """
+    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+
+    # Heatmap
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+
+    # Ticks & labels
+    ax.set_xticks(np.arange(len(class_labels)))
+    ax.set_yticks(np.arange(len(class_labels)))
+    ax.set_xticklabels(class_labels, rotation=25, ha="right",
+                       fontweight="bold", fontsize=15)
+    ax.set_yticklabels(class_labels, fontweight="bold", fontsize=15)
+
+    ax.set_xlabel("Predicted", fontweight="bold", fontsize=16)
+    ax.set_ylabel("True", fontweight="bold", fontsize=16)
+    # ⛔ no title any more
+
+    # Colorbar
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Count", fontweight="bold", fontsize=15)
+
+    # Grid lines between cells
+    ax.set_xticks(np.arange(-0.5, len(class_labels), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(class_labels), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1.2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    # Annotate each cell with bold values, larger font
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            val = cm[i, j]
+            ax.text(
+                j, i, f"{val:d}",
+                ha="center", va="center",
+                color="white" if val > thresh else "black",
+                fontsize=18,
+                fontweight="bold",
+            )
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 # =============================================================================
 # MAIN
@@ -596,10 +914,30 @@ def main():
     y_train = np.concatenate(y_train_list, axis=0)
     y_test = np.concatenate(y_test_list, axis=0)
 
-    # Fit scaler on training past + future windows (same feature space)
-    scaler = StandardScaler()
-    X_flat = np.vstack([s.reshape(-1, s.shape[-1]) for s in (X_train_past + X_train_future)])
-    scaler.fit(X_flat)
+    # Load PROPOSED_MODEL (used as teacher encoder + classifier head)
+    feature_dim = X_train_past[0].shape[1]
+    proposed_model, proposed_scaler, proposed_feat_names = (None, None, None)
+    if USE_PROPOSED_MODEL:
+        proposed_model, proposed_scaler, proposed_feat_names = load_proposed_model(
+            feature_dim, PROPOSED_MODEL_PATH
+        )
+
+        if proposed_feat_names is not None and proposed_feat_names != feat_both:
+            print("[WARN] Feature name mismatch vs PROPOSED_MODEL. "
+                  "Ensure feature extraction order matches.")
+        if proposed_model is not None:
+            print("[INFO] Using PROPOSED_MODEL encoder + classifier head.")
+        else:
+            print("[WARN] PROPOSED_MODEL unavailable. Falling back to predictive head.")
+
+    # Fit or reuse scaler
+    if USE_PROPOSED_SCALER and proposed_scaler is not None:
+        scaler = proposed_scaler
+        print("[INFO] Using PROPOSED_MODEL scaler for predictive model.")
+    else:
+        scaler = StandardScaler()
+        X_flat = np.vstack([s.reshape(-1, s.shape[-1]) for s in (X_train_past + X_train_future)])
+        scaler.fit(X_flat)
 
     # Apply scaler
     X_train_past = apply_scaler(X_train_past, scaler)
@@ -615,9 +953,10 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     # Model
-    feature_dim = X_train_past[0].shape[1]
+    future_steps = X_train_future[0].shape[0]
     model = PredictiveTransformer(
         feature_dim=feature_dim,
+        future_steps=future_steps,
         d_model=64,
         nhead=4,
         num_layers=2,
@@ -634,30 +973,99 @@ def main():
         patience=LR_SCHED_PATIENCE,
         min_lr=LR_SCHED_MIN_LR,
     )
-    ce_loss = nn.CrossEntropyLoss()
     mse_loss = nn.MSELoss()
+    teacher_encoder = proposed_model.encode if proposed_model is not None else None
 
     print("\n================= TRAINING PREDICTIVE TRANSFORMER =================\n")
     best_loss = float("inf")
     best_state = None
     best_epoch = 0
     epochs_no_improve = 0
+    aux_history = {"epoch": [], "latent_mse": [], "seq_mse": [], "latent_cos": []}
+    train_history = {
+        "epoch": [],
+        "train_loss": [],
+        "test_loss": [],
+        "train_acc": [],
+        "test_acc": [],
+        "train_f1": [],
+        "test_f1": [],
+    }
 
     for epoch in range(1, EPOCHS + 1):
-        tr_loss, tr_acc, tr_f1 = train_one_epoch(
-            model, train_loader, optimizer, ce_loss, mse_loss, LATENT_LOSS_WEIGHT
+        tr_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            mse_loss,
+            LATENT_LOSS_WEIGHT,
+            AUX_TARGET,
+            teacher_encoder=teacher_encoder,
         )
-        te_loss, te_acc, te_prec, te_rec, te_f1 = evaluate(model, test_loader, ce_loss)
+        te_loss = evaluate_pred_loss(
+            model,
+            test_loader,
+            mse_loss,
+            LATENT_LOSS_WEIGHT,
+            AUX_TARGET,
+            teacher_encoder=teacher_encoder,
+        )
+
+        if ACC_EVERY > 0 and (epoch % ACC_EVERY == 0):
+            y_true_tr, y_pred_tr = get_predictions_with_proposed(model, proposed_model, train_loader)
+            tr_acc = accuracy_score(y_true_tr, y_pred_tr)
+            tr_f1 = f1_score(y_true_tr, y_pred_tr, zero_division=0)
+        else:
+            tr_acc = float("nan")
+            tr_f1 = float("nan")
+
+        y_true, y_pred = get_predictions_with_proposed(model, proposed_model, test_loader)
+        te_acc = accuracy_score(y_true, y_pred)
+        te_prec = precision_score(y_true, y_pred, zero_division=0)
+        te_rec = recall_score(y_true, y_pred, zero_division=0)
+        te_f1 = f1_score(y_true, y_pred, zero_division=0)
 
         scheduler.step(te_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(
             f"Epoch {epoch:02d}/{EPOCHS} | "
-            f"train_loss={tr_loss:.4f}, train_acc={tr_acc:.3f}, train_f1={tr_f1:.3f} | "
-            f"test_loss={te_loss:.4f}, test_acc={te_acc:.3f}, test_f1={te_f1:.3f} | "
+            f"train_repr_loss={tr_loss:.4f} | "
+            f"test_repr_loss={te_loss:.4f}, test_acc={te_acc:.3f}, test_f1={te_f1:.3f} | "
             f"lr={current_lr:.2e}"
         )
+
+        train_history["epoch"].append(epoch)
+        train_history["train_loss"].append(tr_loss)
+        train_history["test_loss"].append(te_loss)
+        train_history["train_acc"].append(tr_acc)
+        train_history["test_acc"].append(te_acc)
+        train_history["train_f1"].append(tr_f1)
+        train_history["test_f1"].append(te_f1)
+
+        if AUX_METRICS_EVERY > 0 and (epoch % AUX_METRICS_EVERY == 0):
+            lat_mse, seq_mse, lat_cos = compute_aux_metrics(
+                model, test_loader, teacher_encoder=teacher_encoder
+            )
+            if lat_mse is not None:
+                aux_history["epoch"].append(epoch)
+                aux_history["latent_mse"].append(lat_mse)
+                aux_history["seq_mse"].append(seq_mse)
+                aux_history["latent_cos"].append(lat_cos)
+                print(
+                    f"[AUX] latent_mse={lat_mse:.4f} | seq_mse={seq_mse:.4f} | "
+                    f"latent_cos={lat_cos:.4f}"
+                )
+
+        if LATENT_PLOT_EVERY > 0 and (epoch % LATENT_PLOT_EVERY == 0):
+            out_path = os.path.join(PLOTS_DIR, f"latent_alignment_epoch_{epoch:03d}.png")
+            plot_latent_alignment(
+                model,
+                test_loader,
+                out_path,
+                max_points=LATENT_PLOT_MAX_POINTS,
+                teacher_encoder=teacher_encoder,
+            )
 
         if te_loss < (best_loss - EARLY_STOP_MIN_DELTA):
             best_loss = te_loss
@@ -668,7 +1076,7 @@ def main():
             epochs_no_improve += 1
             if epochs_no_improve >= EARLY_STOP_PATIENCE:
                 print(
-                    f"[EARLY STOP] No improvement in test loss for "
+                    f"[EARLY STOP] No improvement in test representation loss for "
                     f"{EARLY_STOP_PATIENCE} epochs. Best epoch: {best_epoch} "
                     f"(loss={best_loss:.4f})."
                 )
@@ -677,8 +1085,12 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    plot_aux_history(aux_history, os.path.join(PLOTS_DIR, "aux_metrics_over_epochs.png"))
+    plot_loss_curves(train_history, os.path.join(EVAL_PLOTS_DIR, "loss_curve.png"))
+    plot_accuracy_curves(train_history, os.path.join(EVAL_PLOTS_DIR, "accuracy_curve.png"))
+
     # Final evaluation
-    y_true, y_pred = get_predictions(model, test_loader)
+    y_true, y_pred = get_predictions_with_proposed(model, proposed_model, test_loader)
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
@@ -689,6 +1101,20 @@ def main():
     print(f"Precision: {prec:.3f}")
     print(f"Recall:    {rec:.3f}")
     print(f"F1:        {f1:.3f}")
+
+    # Performance metrics bar chart
+    plot_metrics_bar(
+        {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1},
+        os.path.join(EVAL_PLOTS_DIR, "performance_metrics.png"),
+    )
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    plot_confusion_matrix(
+        cm,
+        class_labels=[0, 1],
+        out_path=os.path.join(EVAL_PLOTS_DIR, "confusion_matrix.png"),
+    )
 
     # Save checkpoint
     checkpoint = {
@@ -703,6 +1129,9 @@ def main():
         "sampling_hz": SAMPLING_HZ,
         "stride_sec": STRIDE_SEC,
         "latent_loss_weight": LATENT_LOSS_WEIGHT,
+        "aux_target": AUX_TARGET,
+        "use_proposed_model": USE_PROPOSED_MODEL,
+        "use_proposed_scaler": USE_PROPOSED_SCALER,
     }
     torch.save(checkpoint, PREDICTIVE_MODEL_PATH)
     print(f"[PREDICTIVE] Saved model to {PREDICTIVE_MODEL_PATH}")
